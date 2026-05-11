@@ -8,16 +8,6 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import torch
-from botorch.acquisition.fixed_feature import FixedFeatureAcquisitionFunction
-from botorch.acquisition.multi_objective import qExpectedHypervolumeImprovement
-from botorch.fit import fit_gpytorch_model
-from botorch.models import ModelListGP
-from botorch.models.gp_regression import SingleTaskGP
-from botorch.optim import optimize_acqf
-from botorch.utils.multi_objective.box_decompositions import (
-    NondominatedPartitioning,
-)
-from gpytorch.mlls import SumMarginalLogLikelihood
 from nextorch import bo
 from nextorch.parameter import Parameter
 
@@ -499,43 +489,6 @@ def _decode_categoricals(
     return out
 
 
-def _discrete_fixed_features(
-    parameters: list[Parameter],
-    lowers: np.ndarray,
-    ranges: np.ndarray,
-) -> list[dict[int, float]] | None:
-    """Build a list of fixed-feature dicts for all discrete parameter combos.
-
-    For each parameter whose type is ``'categorical'`` or ``'ordinal'``,
-    all valid values are enumerated (from ``p.values``).  The Cartesian
-    product across all discrete parameters gives one dict per combination,
-    where keys are feature column indices and values are the corresponding
-    normalized (to [0, 1]) feature values.
-
-    Returns ``None`` when no discrete parameters are present so the caller
-    can fall back to plain ``optimize_acqf``.
-    """
-    # Collect (feature_index, [normalized_values]) for every discrete param.
-    discrete: list[tuple[int, list[float]]] = []
-    for i, p in enumerate(parameters):
-        if p.x_type in ("categorical", "ordinal"):
-            raw_vals = [float(v) for v in p.values]
-            norm_vals = [(v - lowers[i]) / ranges[i] for v in raw_vals]
-            discrete.append((i, norm_vals))
-
-    if not discrete:
-        return None
-
-    # Cartesian product: start with one empty dict, expand per dimension.
-    combos: list[dict[int, float]] = [{}]
-    for feat_idx, norm_vals in discrete:
-        combos = [
-            {**combo, feat_idx: nv}
-            for combo in combos
-            for nv in norm_vals
-        ]
-    return combos
-
 
 def run_pareto_optimization(
     parameters: list[Parameter],
@@ -616,6 +569,7 @@ def run_pareto_optimization(
     np.random.seed(random_state)
 
     feature_names: list[str] = [p.name for p in parameters]
+    X_ranges = [[p.x_range[0], p.x_range[1]] for p in parameters]
 
     missing = [f for f in feature_names if f not in training_data.columns]
     if missing:
@@ -636,148 +590,52 @@ def run_pareto_optimization(
             "training_data must contain at least 2 rows to fit a GP surrogate."
         )
 
-    # Normalize X to [0, 1] using parameter bounds so all lengthscales
-    # are on a comparable scale.
-    lowers = np.array([p.x_range[0] for p in parameters], dtype=float)
-    uppers = np.array([p.x_range[1] for p in parameters], dtype=float)
-    ranges = np.where(uppers > lowers, uppers - lowers, 1.0)
-    X_norm = (X_real - lowers) / ranges
-
-    X_t = torch.tensor(X_norm, dtype=torch.double)
-    Y_t = torch.tensor(Y_real, dtype=torch.double)
-
-    # One SingleTaskGP per objective, all sharing the same normalized X.
-    models = [
-        SingleTaskGP(X_t, Y_t[:, i:i + 1])
-        for i in range(len(target_cols))
-    ]
-    model = ModelListGP(*models)
-    mll = SumMarginalLogLikelihood(model.likelihood, model)
-    fit_gpytorch_model(mll)
-
     # Reference point: 10 % below the worst observed value per objective.
     if ref_point is None:
-        y_min = Y_t.min(dim=0).values
-        y_range = Y_t.max(dim=0).values - y_min
-        y_range = torch.where(y_range > 0, y_range, torch.ones_like(y_range))
-        ref_pt_t = y_min - 0.1 * y_range
-        ref_pt: list[float] = ref_pt_t.tolist()
-    else:
-        ref_pt = list(ref_point)
-        ref_pt_t = torch.tensor(ref_pt, dtype=torch.double)
+        y_min = Y_real.min(axis=0)
+        y_range = Y_real.max(axis=0) - y_min
+        y_range = np.where(y_range > 0, y_range, np.ones_like(y_range))
+        ref_point = (y_min - 0.1 * y_range).tolist()
 
-    # Partition the non-dominated space w.r.t. the training Pareto front.
-    partitioning = NondominatedPartitioning(ref_point=ref_pt_t, Y=Y_t)
+    exp = bo.EHVIMOOExperiment("nextscreen_pareto")
+    exp.input_data(
+        X_real,
+        Y_real,
+        X_ranges=X_ranges,
+        X_names=feature_names,
+        Y_names=target_cols,
+        unit_flag=True,
+    )
+    exp.set_ref_point(ref_point)
+    exp.set_optim_specs(maximize=True)
 
-    acqf = qExpectedHypervolumeImprovement(
-        model=model,
-        ref_point=ref_pt,
-        partitioning=partitioning,
+    X_new, X_new_real, _ = exp.generate_next_point(
+        n_candidates=n_suggestions
     )
 
-    # Optimize on the unit hypercube (X is already normalized to [0, 1]).
-    bounds_t = torch.stack(
-        [
-            torch.zeros(len(feature_names), dtype=torch.double),
-            torch.ones(len(feature_names), dtype=torch.double),
-        ]
-    )
+    result = pd.DataFrame(X_new_real, columns=feature_names)
 
-    # If any parameters are discrete (categorical / ordinal), enumerate all
-    # valid combinations and optimize the continuous dimensions for each.
-    # This guarantees suggestions land exactly on valid discrete values without
-    # post-hoc rounding.  For the small number of combinations typical in
-    # experimental chemistry (e.g. 4 catalysts × 3 solvents = 12 combos)
-    # the enumeration overhead is negligible.
-    fixed_features_list = _discrete_fixed_features(parameters, lowers, ranges)
-
-    if fixed_features_list:
-        # One optimize_acqf(q=1) call per discrete combo; pick the top
-        # n_suggestions by acquisition value.
-        # Use FixedFeatureAcquisitionFunction instead of the fixed_features=
-        # kwarg: the kwarg triggers an autograd "allow_unused" error with
-        # qEHVI in BoTorch 0.4 because fixed dimensions have no gradient path.
-        all_cands: list[torch.Tensor] = []
-        all_vals: list[float] = []
-        for ff in fixed_features_list:
-            free_dims = [
-                i for i in range(len(feature_names)) if i not in ff
-            ]
-            if len(free_dims) == 0:
-                # Every parameter is discrete — no continuous dims to
-                # optimize.  Evaluate acqf directly at the fixed point.
-                cands_full = torch.tensor(
-                    [[ff[i] for i in range(len(feature_names))]],
-                    dtype=torch.double,
-                )
-                with torch.no_grad():
-                    acq_val_t = acqf(cands_full.unsqueeze(0))
-                all_cands.append(cands_full)
-                all_vals.append(acq_val_t.item())
-                continue
-
-            columns = sorted(ff.keys())
-            values = [ff[c] for c in columns]
-            fixed_acqf = FixedFeatureAcquisitionFunction(
-                acq_function=acqf,
-                d=len(feature_names),
-                columns=columns,
-                values=values,
-            )
-            bounds_free = bounds_t[:, free_dims]
-            cands_free, acq_val = optimize_acqf(
-                fixed_acqf,
-                bounds=bounds_free,
-                q=1,
-                num_restarts=5,
-                raw_samples=64,
-            )
-            cands_full = fixed_acqf._construct_X_full(cands_free)
-            all_cands.append(cands_full)
-            all_vals.append(acq_val.item())
-
-        # Sort descending by acquisition value; return up to n_suggestions.
-        order = np.argsort(all_vals)[::-1]
-        top_k = min(n_suggestions, len(order))
-        if top_k < n_suggestions:
-            logger.info(
-                "Pareto BO: only %d unique discrete combination(s) available; "
-                "returning %d suggestion(s) instead of %d.",
-                len(fixed_features_list),
-                top_k,
-                n_suggestions,
-            )
-        candidates_norm = torch.cat(
-            [all_cands[i] for i in order[:top_k]], dim=0
+    # Predict each objective at the suggested points.
+    try:
+        Y_pred, Y_lower, Y_upper = exp.predict_real(
+            X_new_real, show_confidence=True
         )
-    else:
-        candidates_norm, _ = optimize_acqf(
-            acqf,
-            bounds=bounds_t,
-            q=n_suggestions,
-            num_restarts=10,
-            raw_samples=256,
-        )
-
-    # Denormalize candidates back to original feature scale.
-    candidates_np = candidates_norm.detach().numpy()
-    candidates_real = candidates_np * ranges + lowers
-
-    result = pd.DataFrame(candidates_real, columns=feature_names)
-
-    # Predict each objective at the suggested points using the fitted GPs.
-    # Uncertainty = 1-sigma posterior std from each per-objective GP.
-    model.eval()
-    with torch.no_grad():
+        Y_pred = np.atleast_2d(Y_pred)
+        Y_lower = np.atleast_2d(Y_lower)
+        Y_upper = np.atleast_2d(Y_upper)
         for i, tcol in enumerate(target_cols):
-            post = model.models[i].posterior(candidates_norm)
-            mean_np = post.mean.detach().numpy().flatten()
-            std_np = post.variance.sqrt().detach().numpy().flatten()
-            result[f"predicted_{tcol}"] = mean_np
-            result[f"uncertainty_{tcol}"] = std_np
+            result[f"predicted_{tcol}"] = Y_pred[:, i]
+            result[f"uncertainty_{tcol}"] = (
+                Y_upper[:, i] - Y_lower[:, i]
+            ) / (2.0 * 1.96)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not get predictions for Pareto suggestions: %s", exc
+        )
 
     logger.info(
-        "Pareto BO (qEHVI): %d suggestion(s) across %d objectives (%s).",
+        "Pareto BO (EHVIMOOExperiment): %d suggestion(s) across %d "
+        "objectives (%s).",
         n_suggestions,
         len(target_cols),
         ", ".join(target_cols),
