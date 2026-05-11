@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nextscreen"
+version = "0.1.0"
+description = "Experiment screening and Bayesian optimization toolkit for chemistry — feature selection, consensus ranking, single- and multi-objective BO with Pareto-front exploration."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = [
+    "bayesian optimization", "pareto front", "multi-objective optimization",
+    "feature selection", "chemistry", "chemical engineering",
+    "machine learning", "experiment design",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = [
+    "streamlit>=1.30",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+    "shap>=0.44",
+    "scipy>=1.11",
+    "plotly>=5.18",
+    "openpyxl>=3.1",          # Excel support for pandas
+    "weasyprint>=60.0",        # HTML → PDF export
+    "nextorch==0.4.0",         # Single-objective BO engine
+    "botorch==0.4.0",          # Multi-objective BO (qEHVI Pareto front)
+    "gpytorch==1.4.0",         # GP models used by BoTorch — pinned for nextorch compat
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.3",
+]
+
+[project.scripts]
+nextscreen = "nextscreen.app:main"
+
+[project.urls]
+Homepage = "https://github.com/VlachosGroup/nextscreen"
+Repository = "https://github.com/VlachosGroup/nextscreen"
+Issues = "https://github.com/VlachosGroup/nextscreen/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nextscreen*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=nextscreen --cov-report=term-missing"
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
