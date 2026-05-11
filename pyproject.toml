@@ -34,10 +34,7 @@ dependencies = [
     "scipy>=1.11",
     "plotly>=5.18",
     "openpyxl>=3.1",          # Excel support for pandas
-    "weasyprint>=60.0",        # HTML → PDF export
-    "nextorch==0.4.0",         # Single-objective BO engine
-    "botorch==0.4.0",          # Multi-objective BO (qEHVI Pareto front)
-    "gpytorch==1.4.0",         # GP models used by BoTorch — pinned for nextorch compat
+    "nextorch==0.4.0",         # BO engine (pins botorch<=0.4.0 and gpytorch<=1.4)
 ]
 
 [project.optional-dependencies]
